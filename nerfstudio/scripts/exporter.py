@@ -497,6 +497,9 @@ class ExportGaussianSplat(Exporter):
     ply_color_mode: Literal["sh_coeffs", "rgb"] = "sh_coeffs"
     """If "rgb", export colors as red/green/blue fields. Otherwise, export colors as
     spherical harmonics coefficients."""
+    save_world_frame: bool = False
+    """If set, saves the splats in the same frame as the original dataset. Otherwise, uses the
+    scaled and reoriented coordinate space expected by the NeRF models."""
 
     @staticmethod
     def write_ply(
@@ -599,6 +602,13 @@ class ExportGaussianSplat(Exporter):
                     # transpose(1, 2) was needed to match the sh order in Inria version
                     shs_rest = model.shs_rest.transpose(1, 2).contiguous().cpu().numpy()
                     shs_rest = shs_rest.reshape((n, -1))
+
+                    if self.save_world_frame:
+                        CONSOLE.print(
+                            "Warning: Exporting to world frame, zeroing out higher degree spherical harmonics to avoid rotation artifacts while maintaining file structure."
+                        )
+                        shs_rest[:] = 0
+
                     for i in range(shs_rest.shape[-1]):
                         map_to_tensors[f"f_rest_{i}"] = shs_rest[:, i, None]
 
@@ -645,6 +655,58 @@ class ExportGaussianSplat(Exporter):
             for k, t in map_to_tensors.items():
                 map_to_tensors[k] = map_to_tensors[k][select]
             count = np.sum(select)
+
+        if self.save_world_frame:
+            # Import here to avoid circular dependencies or if scipy is not available globally
+            from scipy.spatial.transform import Rotation
+
+            outputs = pipeline.datamanager.train_dataparser_outputs
+            scale = outputs.dataparser_scale
+            transform_device = outputs.dataparser_transform.device
+
+            # Compute the global transform (from Nerfstudio space to World space)
+            dummy_pose = torch.eye(4, device=transform_device).unsqueeze(0)  # [1, 4, 4]
+            dummy_pose = dummy_pose[:, :3, :]  # [1, 3, 4]
+            transformed_pose = outputs.transform_poses_to_original_space(dummy_pose, camera_convention="opengl")  # [1, 3, 4]
+            transformed_pose = transformed_pose.cpu().numpy()[0]  # [3, 4]
+
+            R_global = transformed_pose[:3, :3]  # [3, 3]
+            t_global = transformed_pose[:3, 3]  # [3]
+
+            # Transform positions
+            positions = np.stack([map_to_tensors["x"], map_to_tensors["y"], map_to_tensors["z"]], axis=1)
+            positions = (positions / scale) @ R_global.T + t_global
+            map_to_tensors["x"] = positions[:, 0]
+            map_to_tensors["y"] = positions[:, 1]
+            map_to_tensors["z"] = positions[:, 2]
+
+            # Transform Rotations
+            # q_new = q_global * q_old
+            r_obj = Rotation.from_matrix(R_global)
+
+            # Reconstruct old quaternions (N, 4) in [w, x, y, z] order
+            qs_old = np.concatenate([map_to_tensors[f"rot_{i}"] for i in range(4)], axis=1)
+            # Convert to [x, y, z, w] for scipy
+            qs_old_scipy = qs_old[:, [1, 2, 3, 0]]
+            r_old = Rotation.from_quat(qs_old_scipy)
+
+            # Combine: R_new = R_global * R_old
+            r_new = r_obj * r_old
+            qs_new_scipy = r_new.as_quat()  # [x, y, z, w]
+            # Convert back to [w, x, y, z]
+            qs_new = qs_new_scipy[:, [3, 0, 1, 2]]
+
+            for i in range(4):
+                map_to_tensors[f"rot_{i}"] = qs_new[:, i, None].astype(np.float32)
+
+            # Transform Scales
+            # new_scales = old_scales - log(scale)
+            log_scale_shift = np.log(scale)
+            for i in range(3):
+                map_to_tensors[f"scale_{i}"] -= log_scale_shift
+
+            if self.ply_color_mode == "sh_coeffs":
+                CONSOLE.print("[bold yellow]Warning: SH coefficients are not rotated to world frame. Colors may appear incorrect.")
 
         ExportGaussianSplat.write_ply(str(filename), count, map_to_tensors)
 
